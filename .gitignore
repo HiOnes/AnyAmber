@@ -1,0 +1,40 @@
+# Local analysis, preprocessing, and scratch code
+analysis/
+data_process/
+tmp/
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Datasets, checkpoints, logs, and training outputs
+data/
+checkpoints/
+runs/
+logs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Local environments and secrets
+.venv/
+venv/
+.env
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+
+# C++/pybind experiment code kept local for now
+src/
+CMakeLists.txt
+extern/
+*.so
+
+# Experimental model variants not used by the core runners yet
+model/*loading.py
+model/match_compact_egat_multi_tag.py

@@ -1,0 +1,223 @@
+import torch.nn.functional as F
+import torch
+from torch import nn
+from util.graph_constructor import GraphConstructor
+
+from model.match_blocks import (
+    DotAttention,
+    DirectionEncoder,
+    FeatureDecoder,
+    MatchAttentionGNN,
+    arange_like,
+    log_optimal_transport,
+)
+
+class MatchCompactEgat(nn.Module):
+    def __init__(self, args, device):
+        
+        super().__init__()        
+        self.pos_pred = nn.Sequential(
+            nn.Linear(3*2+3, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.ReLU(),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 3)
+        )
+        self.cov_pred = nn.Sequential(
+            nn.Linear(3*2+3, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid()
+        )
+
+        self._reset_parameters()
+
+        # gnn
+        self.gnn = MatchAttentionGNN(feature_dim=args.others_embed_size, layer_names=['self', 'cross', 'seq']*4, time_win=args.frame_win)
+        # keypoint encoder & decoder
+        self.kenc = DirectionEncoder(args.others_embed_size)
+        self.kdec = FeatureDecoder(args.others_embed_size)
+
+        bin_score = torch.nn.Parameter(torch.tensor(1.))
+        self.register_parameter('bin_score', bin_score)
+
+        self.dot_attn = DotAttention(device).to(device)
+        self.others_num = args.robot_num - 1
+        self.max_cam_num = args.max_cam_num
+        self.dim = args.others_embed_size
+        self.device = device
+        self.max_cov = 10.0
+        # self.RF = RecordGraph(args.wrt_folder, graph_ind=args.wrt_start_g_id, use_uwb_seq=args.record_uwb_seq, add_noise=False) # record graph to csv
+        self.GC = GraphConstructor(use_uwb_seq=args.record_uwb_seq) # construct hetero graph
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        
+    def sinkhorn_match_compact(self, prior_embed, cam_embed, cam_lost_mask, cam_dir, tw):
+        '''
+        input:
+            prior_embed: [tw*bs, n, dim]
+            cam_embed: [tw*bs, m, dim]
+            cam_lost_mask: [tw*bs, m]
+            cam_dir: [tw*bs, m, 3]
+            tw: int
+        output:
+            out_match: dict
+        '''
+        n, m = prior_embed.shape[1], cam_embed.shape[1]
+        prior_embed = prior_embed.reshape(tw, -1, n, prior_embed.shape[-1]).transpose(0,1).flatten(1,2) # [bs, tw*n, dim]
+        cam_embed = cam_embed.reshape(tw, -1, m, cam_embed.shape[-1]).transpose(0,1).flatten(1,2) # [bs, tw*m, dim]
+        cam_lost_mask = cam_lost_mask.reshape(tw, -1, m).transpose(0,1).flatten(1,2) # [bs, tw*m]
+        cam_dir = cam_dir.reshape(tw, -1, m, cam_dir.shape[-1]).transpose(0,1).flatten(1,2) # [bs, tw*m, 3]
+
+        scores, prob = self.dot_attn(prior_embed, cam_embed, key_padding_mask=cam_lost_mask) # [bs, tw*n, tw*m]
+        scores = scores / prior_embed.shape[-1] ** .5
+
+        # Run the optimal transport.
+        scores = log_optimal_transport(scores, self.bin_score, iters=100) # [bs, tw*n+1, tw*m+1] note!!!
+
+        # Get the matches with score above "match_threshold".
+        max0, max1 = scores[:, :-1, :-1].max(2), scores[:, :-1, :-1].max(1)
+        indices0, indices1 = max0.indices, max1.indices # [bs, tw*n], [bs, tw*m]
+        mutual0 = arange_like(indices0, 1)[None] == indices1.gather(1, indices0) # [bs, tw*n]
+        zero_tensor = torch.tensor(0, dtype=scores.dtype, device=scores.device)
+        mscores0 = torch.where(mutual0, max0.values.exp(), zero_tensor) # [bs, tw*n]
+        valid0 = mutual0 & (mscores0 > 0.6) # [bs, tw*n]
+
+        match_cam_index = indices0.unsqueeze(-1).repeat(1, 1, 3) # [bs, tw*n, 3]
+        match_cam = torch.gather(cam_dir, dim=1, index=match_cam_index) # [bs, tw*n, 3]
+        match_score = mscores0.unsqueeze(-1) # [bs, tw*n, 1]
+        bin_score = scores[:, :-1, -1].exp().unsqueeze(-1) # [bs, tw*n, 1]
+
+        attn_dir = torch.bmm(prob, cam_dir) # [bs, tw*n, 3]
+        attn_dir = F.normalize(attn_dir, p=2.0, dim=2) # [bs, tw*n, 3]
+        var = torch.zeros(attn_dir.shape[0], attn_dir.shape[1], 1).to(self.device) # [bs, tw*n, 1]
+        for i in range(attn_dir.shape[1]):
+            mean = attn_dir[:, i, :].unsqueeze(1) # [bs, 1, 3]
+            gap = cam_dir - mean # [bs, tw*m, 3]
+            gap_square = torch.norm(gap, p=2.0, dim=2, keepdim=True) # [bs, tw*m, 1]
+            bmm = torch.bmm(prob[:,i,:].unsqueeze(1), gap_square) # [bs, 1, 1]
+            var[:, i, :] = bmm.squeeze(1) 
+
+        invalid_index = torch.tensor(-1, dtype=indices0.dtype, device=indices0.device)
+        indices0 = torch.where(valid0, indices0, invalid_index).unsqueeze(-1) # [bs, tw*n, 1]
+
+        match_cam = match_cam.reshape(match_cam.shape[0], tw, n, 3).transpose(0,1).flatten(0,1) # [tw*bs, n, 3]
+        match_score = match_score.reshape(match_score.shape[0], tw, n, 1).transpose(0,1).flatten(0,1) # [tw*bs, n, 1]
+        bin_score = bin_score.reshape(bin_score.shape[0], tw, n, 1).transpose(0,1).flatten(0,1) # [tw*bs, n, 1]
+        var = var.reshape(var.shape[0], tw, n, 1).transpose(0,1).flatten(0,1) # [tw*bs, n, 1]
+
+        out_match = { 'match_cam': match_cam, 'match_score': match_score, 'bin_score': bin_score, 'var': var, 'indices': indices0, 'scores': scores }
+        return out_match
+    
+    def pos_cov_pred(self, match, others_feat):
+        others_d = others_feat[:,:,-1].unsqueeze(2) # [bs, n, 1]
+        others_prior_pos = others_feat[:,:,:3] # [bs, n, 3]
+        attn_pos = others_d * match['match_cam'] # [bsn, n, 3]
+        pos_feat = torch.cat([others_prior_pos, attn_pos, match['var'], match['match_score'], match['bin_score']], dim=2) # [bs, n, 3*2+3]
+        cov = self.cov_pred(pos_feat) # [bs, n, 1]
+        cov = torch.clamp(cov, 1e-4, self.max_cov) # [bs, n, 1] note!!!
+        outputs_relative_pos = self.pos_pred(pos_feat) # [bs, n, 3]
+        outputs_pos = others_prior_pos + outputs_relative_pos # [bs, n, 3]
+        return outputs_pos, cov
+    
+    def forward(self, graph_seq, msg_dict):
+        # graph_seq is list of length [time_window], each element is graph, each graph feat size is [batch, feat]
+        time_win = len(graph_seq) # tw
+        n, m, bsn = self.others_num, self.max_cam_num, 0
+        others_feat, others_cam = None, None # [tw*bs*(n+1)*n, 7+1], [tw*bs*(n+1)*m, 3]
+        for g in range(time_win):
+            dis_seq = graph_seq[g].ndata['dis_seq']['others'] # [bs*(n+1)*n, dis_len]
+            others_feat_dis = torch.cat((graph_seq[g].ndata['feat']['others'], dis_seq[:, -1].unsqueeze(-1)), dim=-1)
+            if others_feat is None:
+                # others_feat = graph_seq[g].ndata['feat']['others']
+                others_feat = others_feat_dis
+                others_cam = graph_seq[g].ndata['feat']['cam']
+                bsn = int(others_feat.shape[0] / n) # bsn = batchsize * (n+1)
+            else:
+                # others_feat = torch.cat((others_feat, graph_seq[g].ndata['feat']['others']), dim=0)
+                others_feat = torch.cat((others_feat, others_feat_dis), dim=0)
+                others_cam = torch.cat((others_cam, graph_seq[g].ndata['feat']['cam']), dim=0)
+        
+        others_prior_pos = others_feat[:, :3] # [tw*bsn*n, 3]
+        others_prior_pos = others_prior_pos.reshape(time_win*bsn, n, 3) # [tw*bsn, n, 3]
+        others_prior_dir = F.normalize(others_prior_pos, p=2.0, dim=-1) # [tw*bsn, n, 3]
+        others_cam = others_cam.reshape(time_win*bsn, m, others_cam.shape[-1]) # [tw*bsn, m, 3]
+        cam_norm2 = torch.norm(others_cam, p=2.0, dim=-1)
+        cam_lost_mask = cam_norm2 < 1e-4 # [tw*bsn, m]
+
+        ########### gnn ############
+        others_encoder, cam_encoder = self.kenc(others_prior_dir), self.kenc(others_cam) # [tw*bsn, dim, n], [tw*bsn, dim, m]
+        others_gnn_feat, cam_gnn_feat = self.gnn(others_encoder, cam_encoder) # others_gnn_feat [tw*bsn, dim, n], cam_gnn_feat [tw*bsn, dim, m]
+        others_gnn_feat, cam_gnn_feat = self.kdec(others_gnn_feat), self.kdec(cam_gnn_feat) # [tw*bsn, dim, n], [tw*bsn, dim, m]
+        others_gnn_feat_split, cam_gnn_feat_split = others_gnn_feat.transpose(1,2).reshape(-1,n+1,n,self.dim), cam_gnn_feat.transpose(1,2).reshape(-1,n+1,m,self.dim) # [tw*bs, n+1, n, dim], [tw*bs, n+1, m, dim]
+        cam_lost_mask_split = cam_lost_mask.reshape(-1, n+1, m) # [tw*bs, n+1, m]
+        others_prior_dir_split = others_prior_dir.reshape(-1, n+1, n, 3) # [tw*bs, n+1, n, 3]
+        others_cam_split = others_cam.reshape(-1, n+1, m, 3) # [tw*bs, n+1, m, 3]
+        others_feat_split = others_feat.reshape(-1, n+1, n, others_feat.shape[-1]) # [tw*bs, n+1, n, 7+1]
+        out_pos = torch.zeros(others_prior_dir_split.shape).to(self.device) # [tw*bs, n+1, n, 3]
+        out_cov = torch.zeros(out_pos.shape[0], n+1, n, 1).to(self.device) # [tw*bs, n+1, n, 1]
+        out_scores = torch.zeros(int(bsn/(n+1)), n+1, time_win*n+1, time_win*m+1).to(self.device) # [bs, n+1, tw*n+1, tw*m+1]
+        out_indices = torch.zeros(out_scores.shape[0], n+1, time_win*n, 1).to(self.device) # [bs, n+1, tw*n, 1]
+        match_cam = torch.zeros(out_pos.shape[0], n+1, n, 3).to(self.device) # [tw*bs, n+1, n, 3]
+
+        for k in range(n+1):
+            others_prior_dir_k = others_prior_dir_split[:, k, :, :] # [tw*bs, n, 3]
+            others_cam_k = others_cam_split[:, k, :, :] # [tw*bs, m, 3]
+            cam_lost_mask_k = cam_lost_mask_split[:, k, :] # [tw*bs, m]
+            cam_lost_mask_k_last = cam_lost_mask_k.reshape(time_win, -1, m)[-1]
+            others_feat_k = others_feat_split[:, k, :, :] # [tw*bs, n, 7+1]
+            dis_lost_mask_k = others_feat_k[:,:,-1] < 1e-4 # [tw*bs, n]
+            dis_lost_mask_k_last = dis_lost_mask_k.reshape(time_win, -1, n)[-1]
+            # if (cam_lost_mask_k.all() or dis_lost_mask_k.any()):  # all cams are lost or any distance is lost
+            if (cam_lost_mask_k_last.all() or dis_lost_mask_k_last.any()):  # all cams are lost or any distance is lost
+                cov_k = torch.ones(out_cov.shape[0], n, 1).to(self.device) * self.max_cov
+                pos_k = others_feat_k[:,:,:3] 
+                scores_k = -torch.inf * torch.ones(out_scores.shape[0], time_win*n+1, time_win*m+1).to(self.device)
+                indices_k = -torch.ones(out_indices.shape[0], time_win*n, 1).to(self.device).to(torch.int64)
+                match_cam_k = torch.zeros(out_pos.shape[0], n, 3).to(self.device)
+            else:
+                match_k = self.sinkhorn_match_compact(others_gnn_feat_split[:, k, :, :], cam_gnn_feat_split[:, k, :, :], cam_lost_mask_k, others_cam_k, time_win)
+                pos_k, cov_k = self.pos_cov_pred(match_k, others_feat_k)
+                scores_k, indices_k, match_cam_k = match_k['scores'], match_k['indices'], match_k['match_cam']
+
+            out_pos[:, k, :, :] = pos_k
+            out_cov[:, k, :, :] = cov_k
+            out_scores[:, k, :, :] = scores_k
+            out_indices[:, k, :, :] = indices_k
+            match_cam[:, k, :, :] = match_cam_k
+        
+        out_pos = out_pos.flatten(0, 1) # [tw*bsn, n, 3]
+        out_cov = out_cov.flatten(0, 1) # [tw*bsn, n, 1]
+        out_scores = out_scores.flatten(0, 1) # [bsn, tw*n+1, tw*m+1]
+        out_indices = out_indices.flatten(0, 1) # [bsn, tw*n, 1]
+
+        # if not valid, modify cov and pos
+        valid = out_indices.reshape(out_indices.shape[0], time_win, n, 1).transpose(0,1).flatten(0,1) > -1 # [tw*bsn, n, 1]
+        invalid_cov = torch.tensor(self.max_cov, dtype=out_cov.dtype, device=out_cov.device)
+        out_cov = torch.where(valid, out_cov, invalid_cov)
+        out_pos = torch.where(valid, out_pos, others_prior_pos)
+
+        ### prepare graph ### Note: Only get the last frame's graph
+        t_decimal = float('0.' + str(msg_dict['timestamp'][0,-1,1].item())[1:])
+        ts = msg_dict['timestamp'][0,-1,0].item() + t_decimal
+        local2map = msg_dict['local2map'][:,-1,:].reshape(-1, n+1, 7) # [bs, n+1, 7]
+        world_pose_delta = msg_dict['world_pose_delta'][:,-1,:].reshape(-1, n+1, 7) # [bs, n+1, 7]
+        out_pose = torch.cat((out_pos.reshape(time_win, -1, n+1, n, 3)[-1], others_feat.reshape(time_win, -1, n+1, n, others_feat.shape[-1])[..., 3:7][-1]), dim=-1) # [bs, n+1, n, 7]
+        label_pose = graph_seq[-1].ndata['label_pos']['others'].reshape(-1, n+1, n, 7) # [bs, n+1, n, 7]
+        gt_dis = graph_seq[-1].ndata['gtdis']['others'].reshape(-1, n+1, n, 1) # [bs, n+1, n, 1]
+        match_cam = match_cam.reshape(time_win, -1, n+1, n, 3)[-1] # [bs, n+1, n, 3]
+        bearing_mask = (out_indices > -1).reshape(-1, n+1, time_win, n)[:,:,-1,:] # [bs, n+1, n]
+        # ##### record graph to csv #####
+        # self.RF.record_graph_tolist_ref(out_pose, label_pose, dis_seq.reshape(-1, n+1, n, dis_seq.shape[-1]), gt_dis, match_cam, bearing_mask, local2map, world_pose_delta, ts)
+        ##### construct hetero graph #####
+        bg = self.GC.construct_graph_ref(out_pose, label_pose, dis_seq.reshape(-1, n+1, n, dis_seq.shape[-1]), gt_dis, match_cam, bearing_mask, local2map, world_pose_delta, ts)
+
+        outputs = {'pos': out_pos, 'cov': out_cov, 'scores': out_scores, 'indices': out_indices}
+        return outputs, bg
