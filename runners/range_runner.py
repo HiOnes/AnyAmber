@@ -57,7 +57,7 @@ def train(args):
     objects = build_objects(args, include_train=True)
     os.makedirs(args.model_file, exist_ok=True)
     best_val_loss = float("inf")
-    keys = ("total", "rot", "cov")
+    keys = ("total", "range", "cov")
     for epoch in range(args.epochs):
         train_metrics = run_epoch(
             objects["model"],
@@ -86,5 +86,5 @@ def train(args):
 def evaluate(args):
     objects = build_objects(args, include_train=False)
     metrics = run_epoch(objects["model"], objects["val_loader"], range_step, args, objects["device"])
-    print_eval(metrics, ("total", "rot", "cov"), title="RangeFilter Validation")
+    print_eval(metrics, ("total", "range", "cov"), title="RangeFilter Validation")
     return metrics
