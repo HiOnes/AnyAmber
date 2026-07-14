@@ -19,7 +19,7 @@
 
 <p align="center">
   <a href="./assets/teaser.png">
-    <img src="./assets/teaser.png" width="100%" alt="AnyAmber unifies single-robot and multi-robot position tracking with different UWB tag, anchor, and bearing configurations." />
+    <img src="./assets/teaser.png" width="90%" alt="AnyAmber unifies single-robot and multi-robot position tracking with different UWB tag, anchor, and bearing configurations." />
   </a>
 </p>
 
@@ -31,28 +31,20 @@
 - **Generalist architecture:** one learnable network adapts to different numbers of robots, anchors, tags, and bearing observations.
 - **Few-shot transfer:** joint pretraining enables adaptation to unseen scenes with only one fine-tuning trajectory.
 
-## Architecture
+## Architecture and Key Modules
 
 <p align="center">
   <a href="./assets/architecture.png">
-    <img src="./assets/architecture.png" width="92%" alt="Overall AnyAmber architecture with range filtering, matching, heterogeneous EGAT localization, and hierarchical pose graph optimization." />
+    <img src="./assets/architecture.png" width="49%" alt="Overall AnyAmber architecture with range filtering, matching, heterogeneous EGAT localization, and hierarchical pose graph optimization." />
   </a>
-</p>
-
-**AnyAmber turns noisy anonymous measurements into accurate poses through one unified pipeline.** A GRU filters UWB ranges, a temporal network matches anonymous bearings, heterogeneous EGAT predicts poses and uncertainty, and hierarchical PGO refines the result. Decentralized robots broadcast only their pose and covariance.
-
-## Key Modules
-
-<p align="center">
   <a href="./assets/submodules.png">
-    <img src="./assets/submodules.png" width="96%" alt="Detailed AnyAmber submodules: unified heterogeneous EGAT, sensor-embedded GRU range filter, and multi-frame matching network." />
+    <img src="./assets/submodules.png" width="47%" alt="Detailed AnyAmber submodules: unified heterogeneous EGAT, sensor-embedded GRU range filter, and multi-frame matching network." />
   </a>
 </p>
 
-- **Heterogeneous EGAT:** unifies dynamic geometric graphs and predicts poses with uncertainty.
-- **Sensor-embedded GRU:** corrects UWB bias and estimates range uncertainty.
-- **Multi-frame matching:** associates anonymous bearings with temporally consistent soft assignments.
-- **Differentiable PGO:** provides robust initialization and geometry-consistent pose refinement.
+**Architecture:** a GRU filters UWB ranges, a temporal network matches anonymous bearings, heterogeneous EGAT predicts poses and uncertainty, and hierarchical PGO refines the result.
+
+**Key modules:** heterogeneous EGAT unifies dynamic geometric graphs, the sensor-embedded GRU corrects UWB bias, multi-frame matching associates anonymous bearings, and differentiable PGO provides geometry-consistent refinement.
 
 ## Experiment Gallery
 
